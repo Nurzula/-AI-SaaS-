@@ -47,6 +47,7 @@ from openpyxl.worksheet.page import PageMargins
 # ----------------------------- 全局配置 -----------------------------
 
 APP_TITLE = "招投标合规审查与 AI 比对 SaaS 系统"
+APP_VERSION = "1.2.0"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DOWNLOAD_FILENAME = "招投标审查评估报告.xlsx"
@@ -58,6 +59,8 @@ CHUNK_OVERLAP_CHARS = 700
 MAX_CHUNKS_PER_DOCUMENT = 24
 EVIDENCE_TARGET_CHARS = 18_000
 EVIDENCE_BATCH_CHARS = 15_000
+EVIDENCE_MAX_TOKENS = 8_192
+FINAL_MAX_TOKENS = 16_384
 
 # 防止异常压缩包或超大文件耗尽 Streamlit Cloud 内存。
 MAX_UPLOAD_BYTES = 80 * 1024 * 1024
@@ -113,6 +116,10 @@ ProgressCallback = Callable[[int, str], None]
 
 class ModelOutputError(ValueError):
     """模型返回空内容、非法 JSON 或字段结构不合规。"""
+
+
+class EmptyModelContentError(ModelOutputError):
+    """模型正常结束但最终 content 为空，可针对 JSON Mode 做降级重试。"""
 
 
 # ----------------------------- DOCX 解析 -----------------------------
@@ -535,28 +542,40 @@ def request_json(
     max_tokens: int,
     logger: Optional[LogCallback] = None,
 ) -> Dict[str, Any]:
-    """请求 JSON 模式；空响应或非法 JSON 时自动重试一次。"""
+    """请求结构化结果，并对 DeepSeek JSON Mode 的偶发空响应做降级重试。"""
 
     json_mode_enabled = True
     last_error: Optional[Exception] = None
+    max_attempts = 3
 
-    for attempt in range(2):
+    for attempt in range(max_attempts):
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         if attempt:
-            messages[1]["content"] += "\n\n请再次作答：务必返回非空、可被 json.loads 解析的严格 JSON。"
+            messages[1]["content"] += (
+                "\n\n请重新生成结果：只返回一个非空 JSON 对象。"
+                "第一个非空字符必须是 {，最后一个非空字符必须是 }；"
+                "不要使用 Markdown、代码围栏或任何解释。"
+            )
 
+        deepseek_v4 = model.strip().lower().startswith("deepseek-v4-")
         request_kwargs: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": max_tokens,
+            # 若上一次因输出长度或 JSON Mode 空白流失败，逐步增加预算；上限避免失控。
+            "max_tokens": min(max_tokens * (2**attempt), 32_768),
             "stream": False,
         }
         if json_mode_enabled:
             request_kwargs["response_format"] = {"type": "json_object"}
+
+        # DeepSeek V4 默认开启思考模式。结构化抽取不需要长思维链；关闭后可避免
+        # reasoning_content 占用输出预算，降低最终 content 为空或被截断的概率。
+        if deepseek_v4:
+            request_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
         try:
             response = client.chat.completions.create(**request_kwargs)
@@ -564,17 +583,40 @@ def request_json(
                 raise ModelOutputError("模型没有返回候选结果。")
             choice = response.choices[0]
             finish_reason = getattr(choice, "finish_reason", None)
-            if finish_reason not in (None, "stop"):
-                raise ModelOutputError(f"模型响应未正常结束（finish_reason={finish_reason}）。")
             content = choice.message.content or ""
+            reasoning_content = getattr(choice.message, "reasoning_content", None) or ""
+            usage = getattr(response, "usage", None)
+            usage_text = ""
+            if usage is not None:
+                usage_text = (
+                    "，usage="
+                    f"{getattr(usage, 'prompt_tokens', '?')}/"
+                    f"{getattr(usage, 'completion_tokens', '?')}/"
+                    f"{getattr(usage, 'total_tokens', '?')}"
+                )
+            accepted_finish_reasons = ("stop",) if deepseek_v4 else (None, "stop")
+            if finish_reason not in accepted_finish_reasons:
+                raise ModelOutputError(
+                    "模型响应未正常结束"
+                    f"（finish_reason={finish_reason}，content={len(content)} 字符，"
+                    f"reasoning_content={len(reasoning_content)} 字符，"
+                    f"max_tokens={request_kwargs['max_tokens']}{usage_text}）。"
+                )
             if not content.strip():
-                raise ModelOutputError("模型返回了空内容。")
-            return extract_first_json_object(content)
+                raise EmptyModelContentError(
+                    "模型返回空 content"
+                    f"（reasoning_content={len(reasoning_content)} 字符，"
+                    f"max_tokens={request_kwargs['max_tokens']}{usage_text}）。"
+                )
+            try:
+                return extract_first_json_object(content)
+            except ModelOutputError as exc:
+                raise ModelOutputError(f"{exc}（content={len(content)} 字符）") from exc
         except BadRequestError as exc:
             message = str(exc).lower()
             unsupported_json_mode = any(
                 keyword in message
-                for keyword in ("response_format", "json mode", "json_object", "unsupported")
+                for keyword in ("response_format", "json mode", "json_object")
             )
             if json_mode_enabled and unsupported_json_mode:
                 json_mode_enabled = False
@@ -585,10 +627,22 @@ def request_json(
             raise
         except ModelOutputError as exc:
             last_error = exc
-            if attempt == 0 and logger:
-                logger("模型首次返回空内容或非法 JSON，正在自动重试。")
+            if attempt < max_attempts - 1:
+                failed_with_json_mode = json_mode_enabled
+                fallback_note = ""
+                if json_mode_enabled and isinstance(exc, EmptyModelContentError):
+                    # DeepSeek 官方说明 JSON Output 偶尔返回空 content。下一次不再发送
+                    # response_format，但仍用 system prompt 和本地解析强制 JSON 结构。
+                    json_mode_enabled = False
+                    fallback_note = "；下一次将关闭 response_format，使用提示词 JSON 模式"
+                if logger:
+                    logger(
+                        f"模型第 {attempt + 1} 次结构化响应无效"
+                        f"（json_mode={'on' if failed_with_json_mode else 'off'}）："
+                        f"{exc}{fallback_note}，正在重试。"
+                    )
 
-    raise ModelOutputError("模型连续两次未返回有效 JSON。") from last_error
+    raise ModelOutputError(f"模型连续 {max_attempts} 次未返回有效 JSON：{last_error}") from last_error
 
 
 def _normalize_scalar(value: Any) -> Any:
@@ -716,7 +770,7 @@ def request_audit_result(
             model=model,
             system_prompt=AUDIT_SYSTEM_PROMPT,
             user_prompt=retry_prompt,
-            max_tokens=8_192,
+            max_tokens=FINAL_MAX_TOKENS,
             logger=logger,
         )
         try:
@@ -783,7 +837,7 @@ def extract_evidence_from_chunks(
             model=model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_tokens=4_096,
+            max_tokens=EVIDENCE_MAX_TOKENS,
             logger=logger,
         )
         all_items.extend(_normalize_evidence_items(payload, fields))
@@ -829,7 +883,7 @@ def compact_evidence(
                 model=model,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                max_tokens=4_096,
+                max_tokens=EVIDENCE_MAX_TOKENS,
                 logger=logger,
             )
             compressed.extend(_normalize_evidence_items(payload, fields))
@@ -1291,6 +1345,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("🔐 API 配置")
+        st.caption(f"应用版本：v{APP_VERSION}")
         api_key = load_deepseek_api_key()
         if api_key:
             st.success("🔒 DeepSeek API Key 已从 Cloud Secrets 安全加载")
@@ -1377,7 +1432,7 @@ def main() -> None:
                 bid_bytes = bid_file.getvalue()
 
                 with st.spinner("正在解析文档并执行智能核查，请勿关闭页面……"):
-                    log("开始在内存中校验并解析两份 DOCX 文件。")
+                    log(f"应用 v{APP_VERSION}：开始在内存中校验并解析两份 DOCX 文件。")
                     update_progress(5, "正在解析招标文件")
                     tender_text, tender_stats = extract_docx_text(tender_bytes, tender_file.name)
                     log(
@@ -1408,7 +1463,7 @@ def main() -> None:
                     client = OpenAI(
                         api_key=api_key.strip(),
                         base_url=normalized_base_url,
-                        timeout=180.0,
+                        timeout=300.0,
                         max_retries=2,
                     )
                     log(f"AI 客户端已初始化，模型：{clean_inline_text(model)}。")
