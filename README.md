@@ -2,7 +2,7 @@
 
 这是一个可部署到 Streamlit Community Cloud 的双 Word 文档审查应用。用户在浏览器中上传招标文件和投标文件，应用通过 DeepSeek/OpenAI 兼容的 Chat Completions API 生成严格 JSON，再在内存中渲染带风险高亮的 Excel 报告。
 
-> 本项目使用 **DeepSeek API Key**，不需要 OpenAI 账户或 OpenAI API Key。依赖中的 `openai` 只是调用 DeepSeek OpenAI 兼容接口的 Python SDK。
+> 本项目使用 **DeepSeek API Key**，不需要 OpenAI 账户或 OpenAI API Key。依赖中的 `openai` 只是调用 DeepSeek OpenAI 兼容接口的 Python SDK。密钥由 `st.secrets` 在服务端读取，不会出现在页面输入框中。
 
 ## 功能
 
@@ -47,12 +47,21 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-启动后在浏览器侧边栏输入 DeepSeek API Key。默认配置为：
+本地运行前，新建 `.streamlit/secrets.toml`：
+
+```toml
+DEEPSEEK_API_KEY = "你的新密钥"
+# 以下两项可省略，省略时使用应用默认值
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+```
+
+该文件已被 `.gitignore` 排除，禁止提交到 GitHub。启动后应用会自动加载密钥。默认配置为：
 
 - Base URL：`https://api.deepseek.com`
 - 模型：`deepseek-v4-flash`
 
-模型名称保留为可编辑项，可按 DeepSeek 控制台或其他 OpenAI 兼容服务商的实际模型 ID 修改。
+Base URL 和模型名称在页面中只读显示，避免访问者把服务端密钥发送到恶意接口或切换到高成本模型。管理员可通过 `DEEPSEEK_BASE_URL` 和 `DEEPSEEK_MODEL` Secrets 修改。
 
 ## 部署到 Streamlit Community Cloud
 
@@ -71,14 +80,23 @@ streamlit run app.py
 
 3. 打开 [Streamlit Community Cloud](https://share.streamlit.io/)，选择 **Create app**。
 4. 选择 GitHub 仓库、`main` 分支和入口文件 `app.py`。
-5. 在 **Advanced settings** 中选择 Python 3.12，然后点击部署。
-6. 部署完成后打开应用，在侧边栏临时输入 DeepSeek API Key 即可使用。
+5. 在 **Advanced settings → Secrets** 中配置以下内容，并选择 Python 3.12：
 
-本项目不要求把 API Key 放入 GitHub 或 Streamlit Secrets。若未来改成服务器统一密钥模式，应只在 Community Cloud 的 Secrets 设置中保存，并在代码中通过 `st.secrets` 读取，禁止硬编码或提交到仓库。
+   ```toml
+   DEEPSEEK_API_KEY = "你的新密钥"
+   # 可选的服务端锁定配置
+   DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+   DEEPSEEK_MODEL = "deepseek-v4-flash"
+   ```
+
+6. 保存设置并部署。应用启动后会显示“API Key 已从 Cloud Secrets 安全加载”，无需用户手动输入。
+
+密钥只能放在 Streamlit Cloud Secrets 或本地 `.streamlit/secrets.toml` 中，禁止硬编码进 `app.py`、README 或提交到 GitHub。
 
 ## 安全与使用边界
 
-- API Key 使用密码输入框，仅用于当前会话请求，不写入 Excel、日志或项目文件。
+- API Key 通过 `st.secrets` 在服务端读取，不提供前端输入框，不写入 Excel、日志或项目文件。
+- 若应用对外公开，任何访问者都可能消耗该 DeepSeek 账户额度；请限制应用访问权限并监控用量。
 - 上传内容会发送到用户填写的 API 服务地址；部署前应确认服务商条款和组织数据安全制度。
 - 应用会拒绝空文件、损坏 DOCX、异常 ZIP 结构及超出安全体积的文件。
 - AI 结论可能遗漏或误判，不构成法律意见；正式投标前必须由专业人员对照原件复核。

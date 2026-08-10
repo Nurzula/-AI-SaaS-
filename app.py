@@ -1164,6 +1164,24 @@ def validate_base_url(base_url: str) -> str:
     return cleaned
 
 
+def load_secret_setting(name: str, default: str = "") -> str:
+    """读取服务端 Secret；缺失时返回安全默认值。"""
+
+    try:
+        value = st.secrets.get(name, default)
+    except Exception:
+        # 本地没有 secrets.toml、Secrets 配置错误等情况统一交由前端安全提示。
+        return default
+    cleaned = str(value).strip() if value is not None else ""
+    return cleaned or default
+
+
+def load_deepseek_api_key() -> str:
+    """从 Streamlit Secrets 读取服务端密钥，不在页面或日志中暴露其值。"""
+
+    return load_secret_setting("DEEPSEEK_API_KEY")
+
+
 def source_identity(
     tender_file: Any,
     bid_file: Any,
@@ -1273,24 +1291,31 @@ def main() -> None:
 
     with st.sidebar:
         st.header("🔐 API 配置")
-        api_key = st.text_input(
-            "API Key",
-            type="password",
-            placeholder="请输入 DeepSeek API Key",
-            help="密钥仅用于本次 Streamlit 会话发起请求，不会写入报告或本地文件。",
-        )
-        base_url = st.text_input(
+        api_key = load_deepseek_api_key()
+        if api_key:
+            st.success("🔒 DeepSeek API Key 已从 Cloud Secrets 安全加载")
+        else:
+            st.error("未检测到 Cloud Secret：DEEPSEEK_API_KEY")
+            st.code('DEEPSEEK_API_KEY = "你的新密钥"', language="toml")
+        base_url = load_secret_setting("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL)
+        model = load_secret_setting("DEEPSEEK_MODEL", DEFAULT_MODEL)
+        st.text_input(
             "Base URL",
-            value=DEFAULT_BASE_URL,
-            help="DeepSeek 官方 OpenAI 兼容地址默认为 https://api.deepseek.com",
+            value=base_url,
+            disabled=True,
+            help="服务端配置已锁定；管理员可通过 DEEPSEEK_BASE_URL Secret 修改。",
         )
-        model = st.text_input(
+        st.text_input(
             "模型名称",
-            value=DEFAULT_MODEL,
-            help="默认使用当前低成本模型 deepseek-v4-flash；也可按服务商实际模型名称修改。",
+            value=model,
+            disabled=True,
+            help="服务端配置已锁定；管理员可通过 DEEPSEEK_MODEL Secret 修改。",
         )
         st.divider()
-        st.caption("文档会发送到你配置的模型服务商。请确认上传和处理方式符合组织的数据安全制度。")
+        st.caption(
+            "密钥只在 Streamlit 服务端读取，不显示在页面、报告或日志中。"
+            "文档会发送到配置的模型服务商，请确认符合组织的数据安全制度。"
+        )
 
     st.title("⚖️ 招投标合规审查与 AI 比对 SaaS 系统")
     st.write(
@@ -1300,7 +1325,8 @@ def main() -> None:
     with st.expander("📘 使用说明", expanded=False):
         st.markdown(
             """
-1. 在左侧填写 DeepSeek API Key；Base URL 和模型名称可按服务商实际配置调整。
+1. 系统会自动读取 Streamlit Cloud Secrets 中的 `DEEPSEEK_API_KEY`；页面不会显示密钥输入框。
+   Base URL 和模型名称同样由服务端锁定，普通访问者无法修改。
 2. 上传两份未加密的 `.docx` 文件。扫描图片中的文字不会自动 OCR，请确保关键条款为可复制文本。
 3. 点击“开始智能核查”。长文档会自动分块，可能产生多次 API 调用并增加等待时间与费用。
 4. AI 结果仅作为辅助审查意见；提交投标前仍需由专业人员依据原件复核。
@@ -1323,7 +1349,9 @@ def main() -> None:
         st.session_state.pop("source_identity", None)
 
         if not api_key.strip():
-            st.error("请先在侧边栏输入 DeepSeek API Key。")
+            st.error(
+                "未读取到 DEEPSEEK_API_KEY。请在 Streamlit Cloud 的 App settings → Secrets 中配置后重启应用。"
+            )
         elif not model.strip():
             st.error("模型名称不能为空。")
         elif tender_file is None or bid_file is None:
