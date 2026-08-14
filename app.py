@@ -45,6 +45,7 @@ from openai import (
 )
 from openpyxl import Workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.page import PageMargins
@@ -53,7 +54,7 @@ from openpyxl.worksheet.page import PageMargins
 # ----------------------------- 全局配置 -----------------------------
 
 APP_TITLE = "招投标合规审查与 AI 比对 SaaS 系统"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DOWNLOAD_FILENAME = "招投标审查评估报告.xlsx"
@@ -4093,6 +4094,21 @@ WARNING_FILL = PatternFill("solid", fgColor="F4B183")
 NORMAL_FILL = PatternFill("solid", fgColor="C6E0B4")
 MANUAL_FILL = PatternFill("solid", fgColor="D9EAF7")
 
+# Excel 是交付给业务负责人的摘要报告，不应直接承载模型内部的全部证据串。
+# 下列上限只作用于可见单元格；原始内容仍写入批注，内部验证结果完全不变。
+EXCEL_VISIBLE_LIMITS = {
+    "核查模块": 18,
+    "检查要点": 32,
+    "招标文件要求": 90,
+    "投标文件现状": 110,
+    "存在问题与缺陷": 100,
+    "修改建议": 100,
+    "评分标准": 140,
+    "得分依据及扣分说明": 110,
+}
+EXCEL_MAX_VISIBLE_SOURCE_IDS = 3
+EXCEL_COMMENT_MAX_CHARS = 30_000
+
 
 def _safe_excel_value(value: Any) -> Any:
     """清除 Excel 非法字符、限制单元格长度并阻断公式注入。"""
@@ -4121,6 +4137,287 @@ def _numeric_excel_value(value: Any) -> Any:
         if re.fullmatch(r"-?(?:\d+(?:\.\d+)?|\.\d+)", cleaned):
             return float(cleaned) if "." in cleaned else int(cleaned)
     return _safe_excel_value(value)
+
+
+def _excel_source_ids(value: Any) -> List[str]:
+    """从显示字段中提取稳定来源 ID，并保持首次出现顺序。"""
+
+    text = clean_inline_text(value)
+    candidates = re.findall(r"【\s*([^】]+?)\s*】", text)
+    if not candidates:
+        candidates = re.findall(
+            r"(?<![A-Za-z0-9_-])(?:TB\d+|FN\d+|[PTHF]\d+(?:-R\d+)?)(?![A-Za-z0-9_-])",
+            text,
+        )
+    return list(dict.fromkeys(clean_inline_text(item) for item in candidates if clean_inline_text(item)))
+
+
+def _compact_excel_source_cell(value: Any, max_ids: int = EXCEL_MAX_VISIBLE_SOURCE_IDS) -> str:
+    """来源列只展示最主要的少量 ID；完整 ID 清单保留在批注中。"""
+
+    source_ids = _excel_source_ids(value)
+    if not source_ids:
+        return _compact_excel_text(value, 48, strip_evidence=False)
+    visible = "、".join(f"【{source_id}】" for source_id in source_ids[:max_ids])
+    if len(source_ids) > max_ids:
+        visible += f" 等{len(source_ids)}处"
+    return visible
+
+
+def _strip_excel_evidence_appendix(value: Any) -> str:
+    """去掉可见字段中重复的来源标签、列坐标和二次原文附录。"""
+
+    text = ILLEGAL_CHARACTERS_RE.sub("", str(value or "")).strip()
+    text = re.sub(r"\r\n?", "\n", text)
+    marker_match = re.search(r"原文摘录\s*[：:]", text)
+    if marker_match:
+        leading = text[: marker_match.start()].strip()
+        trailing = text[marker_match.end() :].strip()
+        # 某些确定性事实只有“原文摘录”而没有摘要，此时仍保留原文的开头。
+        text = leading if leading and leading not in {"无", "无。"} else trailing
+    text = re.sub(r"【\s*[^】]+?\s*】\s*[、,，;；]*", "", text)
+    text = re.sub(r"(?<![A-Za-z0-9])C\d+\s*[：:]\s*", "", text)
+    text = re.sub(r"[ \t\u3000]+", " ", text)
+    text = re.sub(r"\s*\n\s*", "；", text)
+    text = re.sub(r"[；;]{2,}", "；", text)
+    return text.strip(" ；;")
+
+
+def _compact_excel_text(value: Any, limit: int, *, strip_evidence: bool = True) -> str:
+    """生成适合经理快速扫读的短句；超长原文由 Excel 批注承载。"""
+
+    text = (
+        _strip_excel_evidence_appendix(value)
+        if strip_evidence
+        else clean_inline_text(ILLEGAL_CHARACTERS_RE.sub("", str(value or "")))
+    )
+    if len(text) <= limit:
+        return text
+
+    suffix = "…（完整信息见批注）"
+    available = max(12, limit - len(suffix))
+    candidate = text[:available]
+    # 尽量在完整分句处结束，避免机械地切断中文表达。
+    punctuation = max(candidate.rfind(char) for char in "。；;，,！？!?")
+    if punctuation >= int(available * 0.58):
+        candidate = candidate[: punctuation + 1]
+    return candidate.rstrip(" ；;，,") + suffix
+
+
+def _compact_excel_bid_state(row: Mapping[str, Any], value: Any) -> str:
+    """对正式报价表留白这类高频关键事实生成可直接决策的一句话现状。"""
+
+    raw = ILLEGAL_CHARACTERS_RE.sub("", str(value or ""))
+    checkpoint = clean_inline_text(row.get("检查要点", ""))
+    if "报价" in checkpoint and raw.count("(空)") >= 2:
+        prices = list(
+            dict.fromkeys(
+                re.findall(r"(?<!\d)(\d{2,5}(?:\.\d+)?)\s*元\s*/\s*人", raw)
+            )
+        )
+        summary = "正式报价一览表的单价、合计金额及总价字段为空。"
+        if prices:
+            summary += f"附表另列{'、'.join(f'{price}元/人' for price in prices[:4])}，不能替代正式报价。"
+        return _compact_excel_text(summary, EXCEL_VISIBLE_LIMITS["投标文件现状"], strip_evidence=False)
+    return _compact_excel_text(value, EXCEL_VISIBLE_LIMITS["投标文件现状"])
+
+
+def _excel_comment_text(value: Any) -> str:
+    """构造安全、有限长的完整证据批注。"""
+
+    text = ILLEGAL_CHARACTERS_RE.sub("", str(value or "")).strip()
+    prefix = "完整核查信息（仅供追溯）：\n"
+    limit = max(0, EXCEL_COMMENT_MAX_CHARS - len(prefix))
+    if len(text) > limit:
+        text = text[: max(0, limit - 12)] + "\n……内容已截断"
+    return prefix + text
+
+
+def _excel_row_audit_text(row: Mapping[str, Any]) -> str:
+    """把一条被折叠的内部记录转为可放入批注的审计文本。"""
+
+    return "\n".join(
+        f"{field}：{clean_inline_text(row.get(field, ''))}"
+        for field in DEFECT_FIELDS
+        if clean_inline_text(row.get(field, ""))
+    )
+
+
+def _is_excel_no_action(value: Any) -> bool:
+    """识别没有形成任何业务问题或动作的占位文字。"""
+
+    text = clean_inline_text(value).strip("。.;； ")
+    return text in {
+        "",
+        "无",
+        "未发现",
+        "未发现问题",
+        "无问题",
+        "无明显问题",
+        "无需修改",
+        "不适用",
+    }
+
+
+def _is_excel_visual_manual_row(row: Mapping[str, Any]) -> bool:
+    if _risk_category(row.get("风险等级", "")) != "manual":
+        return False
+    text = " ".join(
+        clean_inline_text(row.get(field, ""))
+        for field in ("检查要点", "投标文件现状", "存在问题与缺陷", "修改建议")
+    )
+    return any(keyword in text for keyword in ("图片", "印章", "手写", "扫描", "签字", "盖章", "原件"))
+
+
+def _is_excel_quotation_duplicate(row: Mapping[str, Any], has_fatal_quotation: bool) -> bool:
+    """已有确定性报价高风险行时，折叠同主题的人工占位/重复描述。"""
+
+    if not has_fatal_quotation or _risk_category(row.get("风险等级", "")) != "manual":
+        return False
+    module = clean_inline_text(row.get("核查模块", ""))
+    text = " ".join(
+        clean_inline_text(row.get(field, ""))
+        for field in ("检查要点", "投标文件现状", "存在问题与缺陷")
+    )
+    return "报价" in module and any(
+        keyword in text for keyword in ("报价完整", "报价一览表", "具体报价", "报价得分")
+    )
+
+
+def _make_excel_visual_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    all_sources = "、".join(clean_inline_text(row.get("招标文件出处", "")) for row in rows)
+    detail = "\n\n".join(_excel_row_audit_text(row) for row in rows)
+    return {
+        "序号": 0,
+        "核查模块": "原件与视觉材料",
+        "检查要点": "签章、凭证及扫描证明材料",
+        "招标文件出处": all_sources,
+        "招标文件要求": "签字盖章、许可证、凭证及证明材料须按招标文件提供。",
+        "投标文件现状": "本系统仅核查可提取文字，未识别图片、印章、手写签名及扫描证明材料。",
+        "存在问题与缺陷": f"共 {len(rows)} 项视觉或原件事项无法仅凭文字作确定判断。",
+        "风险等级": "待人工复核",
+        "修改建议": "人工核对 Word 原件中的签章、缴款凭证、许可证及业绩证明材料。",
+        "_excel_comments": {"存在问题与缺陷": detail},
+    }
+
+
+def _make_excel_folded_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    all_sources = "、".join(clean_inline_text(row.get("招标文件出处", "")) for row in rows)
+    detail = "\n\n".join(_excel_row_audit_text(row) for row in rows)
+    return {
+        "序号": 0,
+        "核查模块": "审查范围说明",
+        "检查要点": "折叠的重复/非行动项",
+        "招标文件出处": all_sources,
+        "招标文件要求": "仅对可提取文字进行核查；没有形成明确问题的记录不逐条占用主表。",
+        "投标文件现状": f"已将 {len(rows)} 条重复、无明确问题或通道覆盖说明折叠到本行。",
+        "存在问题与缺陷": "折叠项不代表已自动确认合规；完整清单保留在本单元格批注中。",
+        "风险等级": "待人工复核",
+        "修改建议": "正式决策前按需打开批注抽查，并结合两份 Word 原件终审。",
+        "_excel_comments": {"存在问题与缺陷": detail},
+    }
+
+
+def _prepare_excel_defect_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """把内部核查台账投影为经理可读的缺陷/行动清单。"""
+
+    copied_rows = [dict(row) for row in rows if isinstance(row, Mapping)]
+    has_fatal_quotation = any(
+        _risk_category(row.get("风险等级", "")) == "fatal"
+        and "报价" in " ".join(
+            (clean_inline_text(row.get("核查模块", "")), clean_inline_text(row.get("检查要点", "")))
+        )
+        for row in copied_rows
+    )
+
+    kept: List[Tuple[int, Dict[str, Any]]] = []
+    visual_rows: List[Mapping[str, Any]] = []
+    folded_rows: List[Mapping[str, Any]] = []
+    visual_first = len(copied_rows) + 1
+    folded_first = len(copied_rows) + 2
+
+    for index, row in enumerate(copied_rows):
+        risk_category = _risk_category(row.get("风险等级", ""))
+        issue = row.get("存在问题与缺陷", "")
+        recommendation = row.get("修改建议", "")
+        if _is_excel_visual_manual_row(row):
+            visual_first = min(visual_first, index)
+            visual_rows.append(row)
+            continue
+        if (
+            (risk_category == "manual" and _is_excel_no_action(issue) and _is_excel_no_action(recommendation))
+            or "自动核查未能可靠完成" in clean_inline_text(row.get("检查要点", ""))
+            or _is_excel_quotation_duplicate(row, has_fatal_quotation)
+        ):
+            folded_first = min(folded_first, index)
+            folded_rows.append(row)
+            continue
+        kept.append((index, row))
+
+    if visual_rows:
+        kept.append((visual_first, _make_excel_visual_summary(visual_rows)))
+    if folded_rows:
+        kept.append((folded_first, _make_excel_folded_summary(folded_rows)))
+
+    risk_order = {"fatal": 0, "warning": 1, "manual": 2, "normal": 3, "unknown": 4}
+    kept.sort(key=lambda item: (risk_order.get(_risk_category(item[1].get("风险等级", "")), 4), item[0]))
+
+    prepared: List[Dict[str, Any]] = []
+    for sequence, (_, row) in enumerate(kept, start=1):
+        display: Dict[str, Any] = {"序号": sequence}
+        comments: Dict[str, str] = dict(row.get("_excel_comments", {})) if isinstance(row.get("_excel_comments"), Mapping) else {}
+        for field in DEFECT_FIELDS[1:]:
+            raw = row.get(field, "")
+            if field == "招标文件出处":
+                visible = _compact_excel_source_cell(raw)
+            elif field == "投标文件现状":
+                visible = _compact_excel_bid_state(row, raw)
+            elif field in EXCEL_VISIBLE_LIMITS:
+                visible = _compact_excel_text(raw, EXCEL_VISIBLE_LIMITS[field])
+            else:
+                visible = clean_inline_text(raw)
+            display[field] = visible
+            raw_text = ILLEGAL_CHARACTERS_RE.sub("", str(raw or "")).strip()
+            if raw_text and clean_inline_text(raw_text) != clean_inline_text(visible):
+                comments.setdefault(field, raw_text)
+        if comments:
+            display["_excel_comments"] = comments
+        prepared.append(display)
+    return prepared
+
+
+def _prepare_excel_scoring_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    prepared: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        display: Dict[str, Any] = {}
+        comments: Dict[str, str] = {}
+        for field in SCORING_FIELDS:
+            raw = row.get(field, "")
+            if field == "招标文件出处":
+                visible: Any = _compact_excel_source_cell(raw)
+            elif field in EXCEL_VISIBLE_LIMITS:
+                visible = _compact_excel_text(raw, EXCEL_VISIBLE_LIMITS[field])
+            else:
+                visible = raw
+            display[field] = visible
+            raw_text = ILLEGAL_CHARACTERS_RE.sub("", str(raw or "")).strip()
+            if raw_text and clean_inline_text(raw_text) != clean_inline_text(visible):
+                comments[field] = raw_text
+        if comments:
+            display["_excel_comments"] = comments
+        prepared.append(display)
+    return prepared
+
+
+def prepare_excel_report_data(result: Mapping[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """生成不修改原始核查结果的 Excel/前端展示投影。"""
+
+    return {
+        "defects_list": _prepare_excel_defect_rows(result.get("defects_list", [])),
+        "scoring_list": _prepare_excel_scoring_rows(result.get("scoring_list", [])),
+    }
 
 
 def _display_width(value: Any) -> int:
@@ -4210,13 +4507,22 @@ def _style_worksheet(
                 cell.fill = NORMAL_FILL
                 cell.font = Font(name="微软雅黑", size=10, color="000000")
             elif manual:
-                cell.fill = MANUAL_FILL
-                cell.font = Font(name="微软雅黑", size=10, color="1F2937", italic=True)
+                # 人工复核是证据状态，不应把整行变成斜体或形成大面积蓝色墙。
+                # 只高亮“风险等级”单元格，其余单元格保持正常正文样式。
+                if risk_column_index == column_index:
+                    cell.fill = MANUAL_FILL
+                    cell.font = Font(name="微软雅黑", size=10, bold=True, color="1F2937")
+                elif row_index % 2 == 0:
+                    cell.fill = ZEBRA_FILL
             elif row_index % 2 == 0:
                 cell.fill = ZEBRA_FILL
 
             cap = max(width_caps[column_index - 1], 1)
-            max_wrapped_lines = max(max_wrapped_lines, math.ceil(_display_width(cell.value) / cap))
+            wrapped_lines = sum(
+                max(1, math.ceil(_display_width(line) / cap))
+                for line in str(cell.value or "").splitlines() or [""]
+            )
+            max_wrapped_lines = max(max_wrapped_lines, wrapped_lines)
 
         worksheet.row_dimensions[row_index].height = min(120, max(24, 18 * max_wrapped_lines))
 
@@ -4251,6 +4557,7 @@ def _style_worksheet(
 def build_excel_report(result: Dict[str, List[Dict[str, Any]]]) -> io.BytesIO:
     """在内存中生成包含两张专业工作表的 Excel 报告。"""
 
+    report_data = prepare_excel_report_data(result)
     workbook = Workbook()
     workbook.properties.creator = APP_TITLE
     workbook.properties.title = "招投标审查评估报告"
@@ -4260,12 +4567,21 @@ def build_excel_report(result: Dict[str, List[Dict[str, Any]]]) -> io.BytesIO:
     defects_sheet = workbook.active
     defects_sheet.title = "缺陷核查记录"
     defects_sheet.append(DEFECT_FIELDS)
-    for item in result.get("defects_list", []):
+    for item in report_data.get("defects_list", []):
         defects_sheet.append([_safe_excel_value(item.get(field, "")) for field in DEFECT_FIELDS])
+        row_index = defects_sheet.max_row
+        comments = item.get("_excel_comments", {})
+        if isinstance(comments, Mapping):
+            for field, comment_value in comments.items():
+                if field in DEFECT_FIELDS and clean_inline_text(comment_value):
+                    defects_sheet.cell(row=row_index, column=DEFECT_FIELDS.index(field) + 1).comment = Comment(
+                        _excel_comment_text(comment_value),
+                        "AI 核查系统",
+                    )
 
     scoring_sheet = workbook.create_sheet("预估打分表")
     scoring_sheet.append(SCORING_FIELDS)
-    for item in result.get("scoring_list", []):
+    for item in report_data.get("scoring_list", []):
         scoring_sheet.append(
             [
                 _numeric_excel_value(item.get(field, ""))
@@ -4274,17 +4590,26 @@ def build_excel_report(result: Dict[str, List[Dict[str, Any]]]) -> io.BytesIO:
                 for field in SCORING_FIELDS
             ]
         )
+        row_index = scoring_sheet.max_row
+        comments = item.get("_excel_comments", {})
+        if isinstance(comments, Mapping):
+            for field, comment_value in comments.items():
+                if field in SCORING_FIELDS and clean_inline_text(comment_value):
+                    scoring_sheet.cell(row=row_index, column=SCORING_FIELDS.index(field) + 1).comment = Comment(
+                        _excel_comment_text(comment_value),
+                        "AI 核查系统",
+                    )
 
     _style_worksheet(
         defects_sheet,
         DEFECT_FIELDS,
-        width_caps=[8, 18, 26, 26, 42, 42, 42, 16, 42],
+        width_caps=[7, 14, 20, 18, 25, 28, 25, 14, 26],
         risk_column_index=DEFECT_FIELDS.index("风险等级") + 1,
     )
     _style_worksheet(
         scoring_sheet,
         SCORING_FIELDS,
-        width_caps=[24, 12, 44, 28, 16, 48],
+        width_caps=[16, 10, 34, 18, 15, 32],
     )
 
     output = io.BytesIO()
@@ -4391,8 +4716,10 @@ def friendly_error_message(exc: Exception) -> str:
 
 
 def render_result_preview(result: Dict[str, List[Dict[str, Any]]]) -> None:
-    defects = result.get("defects_list", [])
-    scoring = result.get("scoring_list", [])
+    report_data = prepare_excel_report_data(result)
+    defects = report_data.get("defects_list", [])
+    scoring = report_data.get("scoring_list", [])
+    raw_defect_count = len(result.get("defects_list", []))
     fatal_count = sum(
         1 for item in defects if _risk_category(item.get("风险等级", "")) == "fatal"
     )
@@ -4409,6 +4736,11 @@ def render_result_preview(result: Dict[str, List[Dict[str, Any]]]) -> None:
     metric_columns[2].metric("扣分/瑕疵风险", warning_count)
     metric_columns[3].metric("待人工复核", manual_count)
     metric_columns[4].metric("评分项", len(scoring))
+    if raw_defect_count > len(defects):
+        st.caption(
+            f"已将 {raw_defect_count - len(defects)} 条重复、无明确问题或过程性记录折叠到报告批注中，"
+            "主表仅展示可执行事项。"
+        )
 
     defects_tab, scoring_tab = st.tabs(["缺陷核查预览", "预估打分预览"])
     with defects_tab:
