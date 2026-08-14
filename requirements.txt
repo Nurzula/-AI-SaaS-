@@ -1,5 +1,5 @@
 # Streamlit Community Cloud 会从本文件安装 Python 依赖。
-# 以下版本已在本项目 v2.0.0 的当前环境中验证。
+# 以下版本已在本项目 v3.0.0 的当前环境中验证。
 streamlit==1.61.1
 openai==2.53.0
 python-docx==1.2.0

@@ -1,32 +1,42 @@
 # 招投标合规审查与 AI 比对 SaaS 系统
 
-当前应用版本：**v2.0.0**
+当前版本：**v3.0.0**
 
-这是一个可部署到 Streamlit Community Cloud 的双 Word 文档审查应用。用户上传招标文件与投标文件后，系统调用 DeepSeek 的 OpenAI 兼容接口完成逐要求核查，并在内存中生成带风险高亮的 Excel 报告。
+这是一个可部署到 Streamlit Community Cloud 的双 Word 文档文字核查应用。用户上传招标文件和投标文件后，系统通过 DeepSeek 的 OpenAI 兼容接口并发完成三类核查，在内存中生成带风险高亮的 Excel 报告。
 
-> 本项目使用 **DeepSeek API Key**，不需要 OpenAI 账户或 OpenAI API Key。依赖包 `openai` 仅作为调用 DeepSeek OpenAI 兼容接口的 Python SDK。密钥由 `st.secrets` 在服务端读取，不会显示在页面输入框中。
+默认模型为 `deepseek-v4-flash`。项目依赖 `openai` 仅用于调用兼容接口，不需要 OpenAI API Key。
 
-## v2 审查流程
+## v3 核查流程
 
-v2 对短文档和长文档统一执行以下可追溯流程：
+v3 不再采用 v2 的“逐块清点、全文补扫、失败递归二分”流程。
 
-1. **逐要求建账**：将招标文件解析为有序文字来源块，逐块清点资格、实质性、废标、商务、技术、报价、合同、提交与评分要求，为每条原子要求分配稳定 ID。
-2. **本地候选检索 + 重点全文补扫**：在投标文件文字来源块上建立本地索引，按每条要求检索可引用的候选证据；对强制/废标、评分和本地未命中要求，再让小组要求共享分批扫描全部可提取投标文字，避免按要求反复发送整份正文。候选未命中仍不等于全文不存在，补扫失败会显式转人工复核。
-3. **小批核查**：按要求 ID 将要求与各自的候选证据组成小批次，请模型逐条判断，禁止合并、跳过、增加要求或引用候选包之外的出处；确定性结论的来源 ID 和原文摘录必须通过 Python 逐字核验。
-4. **失败二分或人工占位**：批次过大、JSON 不完整或结构校验失败时，系统按来源块或要求 ID 二分后重试；单项仍失败、任务时限或模型调用预算接近上限时，会停止继续消耗 API，并为尚未可靠完成的来源/要求生成“待人工复核”占位记录，不接受部分返回冒充完整结果。
-5. **Python 数量守恒**：由 Python 校验来源块清点、要求 ID、批次返回和最终结果。每条已建账要求必须且只能对应一条核查结果，评分要求还必须对应一条评分结果；数量或 ID 不一致时任务失败，不会静默生成缺项报告。
+1. **完整文字解析**：按 Word 原始顺序提取正文、表格、页眉页脚、文本框和脚注，为每个段落或表格行保留稳定来源 ID。空表格单元格保留为 `(空)`。
+2. **规则锚点**：Python 本地标记废标、报价、保证金、评分、金额、期限、技术和合同等重点来源。锚点只保留 ID、类别与来源定位，并要求结果行的招标来源与锚点来源一致；不会把每个普通段落扩写成模型台账。
+3. **三路并发长上下文核查**：三个独立客户端同时读取两份完整可提取文字：
+   - 资格、废标与形式核查；
+   - 评分办法与预估得分；
+   - 技术、商务与合同核查。
+4. **有界调用**：正常路径仅 3 次 API 请求；每个通道最多重试一次，整单绝对上限 6 次。首次输出预算 24K tokens，唯一重试使用 32K tokens。禁止递归拆分来源块。
+5. **双层结构与逐行验真**：顶层协议缺字段、错通道或空评分会触发该通道唯一一次重试；通过顶层门槛后，Python 再逐行验证来源 ID、逐字摘录、锚点—来源关联、风险依据和评分边界。坏行只转成“待人工复核”，不会让有效同级行作废。
+6. **文字模式安全规则**：图片、扫描合同、公章、手写签名和证件照片不会被模型当成已确认事实；相关结论强制转人工复核。程序也会阻断“已废标”等过度确定表述，并按被引用局部来源优先核对项目编号，不会用其他页面的正确编号掩盖局部错误。
+7. **内存 Excel**：结果由 Python 合并、排序、编号，通过 `BytesIO` 生成两张工作表，不在服务器写绝对路径文件。
 
-这里的“程序层不静默丢项”是指：来源块和已经进入要求台账的条目均接受完整性、唯一性与数量守恒校验，自动处理失败会显式留下人工复核记录。它不等于模型理解准确率为 100%，也不能保证模型从自然语言中识别出全部隐含要求。AI 仍可能误判、错误拆分或未识别语义，最终报告必须由专业人员对照原件复核。
+## 输出报告
 
-## 功能与边界
+- `缺陷核查记录`：序号、核查模块、检查要点、招标出处与要求、投标现状、问题、风险和建议。
+- `预估打分表`：评分项、满分、评分规则、招标出处、当前预估得分和扣分说明。
+- 致命/废标风险：红底白字加粗。
+- 扣分/瑕疵：橙底黑字加粗。
+- 正常/符合：绿底黑字。
+- 待人工复核：浅蓝中性色斜体，不伪装成确定结论。
 
-- 提取 `.docx` 中可读取的正文、表格、嵌套表格、页眉页脚、文本框和脚注文字。
-- 保留段落、表格行等来源标记，便于从 Excel 回查原文。
-- 输出“缺陷核查记录”和“预估打分表”两张工作表。
-- 对致命/废标、扣分/瑕疵、正常/符合等风险进行颜色标记。
-- Excel 使用 `io.BytesIO` 在内存中生成，不依赖服务器绝对路径。
-- 当前版本**只审查可提取文字，不执行 OCR，也不理解图片视觉内容**。扫描页、证书照片、印章、签字和图片中的文字必须人工复核。
-- AI 结果是辅助意见，不构成法律意见、最终评分或投标决策。
+## 功能边界
+
+- 仅核查 `.docx` 中可提取的文字和表格内容。
+- 不执行 OCR，不识别图片、扫描件、签字笔迹或印章真伪。
+- 文档中的命令或提示词按不可信数据处理，不会改变系统角色。
+- AI 结果是辅助审查意见，不构成法律意见、最终评分或投标决策。
+- Streamlit Community Cloud 上的任务是同步任务；运行期间需保持页面连接，刷新、关页、重启或重新部署会中断当前任务。
 
 ## 项目文件
 
@@ -37,14 +47,13 @@ v2 对短文档和长文档统一执行以下可追溯流程：
 ├── README.md
 ├── .gitignore
 └── tests/
-    └── test_requirement_workflow.py
+    ├── test_requirement_workflow.py
+    └── test_v3_performance_contracts.py
 ```
 
 ## 本地运行
 
-推荐使用 Python 3.12。项目依赖已固定为当前验证版本，避免云端重新解析依赖时发生行为漂移。
-
-Windows PowerShell：
+推荐 Python 3.12。
 
 ```powershell
 python -m venv .venv
@@ -54,93 +63,41 @@ python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
-macOS / Linux：
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
-```
-
-开发环境安装 `pytest` 后可运行离线回归测试（测试不会调用真实模型 API；生产部署无需安装 `pytest`）：
-
-```bash
-python -m pip install pytest
-python -m pytest -q
-```
-
-首次本地运行前，新建 `.streamlit/secrets.toml`：
+本地 Secrets 文件：`.streamlit/secrets.toml`
 
 ```toml
 DEEPSEEK_API_KEY = "你的 DeepSeek API Key"
-
-# 可选；省略时使用 app.py 中的默认值
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 ```
 
-`.streamlit/secrets.toml` 应由 `.gitignore` 排除。不要把真实密钥写进 `app.py`、README、截图、日志或 Git 提交。Base URL 和模型在页面只读显示，只能由管理员通过 Secrets 修改。
+`.streamlit/secrets.toml` 已被 `.gitignore` 排除。页面只显示服务端锁定后的 Base URL 和模型名，不显示密钥输入框。
 
-## 部署到 Streamlit Community Cloud
+## 测试
 
-1. 在 GitHub 创建仓库，将 `app.py`、`requirements.txt`、`README.md`、`.gitignore` 和 `tests/` 放在仓库中。`.gitignore` 是正常的隐藏配置文件：GitHub 网页若不便新建或显示它，请在本地直接运行下面的 `git add .gitignore`，Git 会正常上传。不要提交真实招投标文件、生成的报告或 `.streamlit/secrets.toml`。
-2. 提交并推送代码；提交前使用 `git status` 和 `git diff --cached` 核对暂存内容：
+开发环境安装 `pytest` 后运行：
 
-   ```bash
-   git init
-   git add app.py requirements.txt README.md .gitignore tests
-   git commit -m "release: bid compliance reviewer v2.0.0"
-   git branch -M main
-   git remote add origin https://github.com/<你的用户名>/<仓库名>.git
-   git push -u origin main
-   ```
+```powershell
+python -m pytest -q
+python -m py_compile app.py
+```
 
-3. 打开 [Streamlit Community Cloud](https://share.streamlit.io/)，选择 **Create app**，指定 GitHub 仓库、`main` 分支和入口文件 `app.py`。
-4. 在部署设置中选择 Python 3.12，并在 **Advanced settings → Secrets** 填入：
+离线测试不会调用真实模型 API，覆盖 DOCX 来源解析、三路并发、六次调用硬上限、输出长度唯一重试、顶层协议重试、锚点—来源绑定、逐行错误隔离、文字模式安全规则和 Excel 内存生成。
+
+上线验收还应使用组织自己的 DeepSeek 账户对代表性真实文档连续执行端到端测试，记录总耗时、API 调用数、Token 用量和人工抽检结果。
+
+## Streamlit Community Cloud 部署
+
+1. 将 `app.py`、`requirements.txt`、`README.md`、`.gitignore` 和 `tests/` 推送到 GitHub 仓库。
+2. 在 Streamlit Community Cloud 选择该仓库、部署分支和入口文件 `app.py`。
+3. Python 版本选择 3.12。
+4. 在 **App settings → Secrets** 配置：
 
    ```toml
    DEEPSEEK_API_KEY = "你的 DeepSeek API Key"
-
-   # 可选的服务端锁定配置
    DEEPSEEK_BASE_URL = "https://api.deepseek.com"
    DEEPSEEK_MODEL = "deepseek-v4-flash"
    ```
 
-5. 保存并部署。启动后侧边栏应同时显示“DeepSeek API Key 已从 Cloud Secrets 安全加载”和“应用版本：v2.0.0”。
-6. 更新 `app.py` 或依赖后，等待 Community Cloud 完成重新部署。若页面仍显示旧版本、依赖未刷新或应用状态异常，在应用管理菜单中执行 **Reboot app**，随后再次核对侧边栏必须为 **v2.0.0**。若仍不是 v2.0.0，请检查部署分支、入口文件及 GitHub 最新提交是否正确。
-
-### Community Cloud 运行注意事项
-
-- 当前实现是同步任务。点击“开始智能核查”后必须保持页面打开并维持网络连接，直到出现完成提示和下载按钮；刷新、关闭标签页、网络中断、应用重启或重新部署都可能中断本次任务，且不能断点恢复。
-- 长文档会产生多次模型调用，处理时间和费用高于短文档。请根据页面日志等待，不要重复点击提交。
-- 招投标文档通常包含敏感信息，并且部署者的 DeepSeek Key 由所有获准访问者共用。建议使用私有 GitHub 仓库，并将 Streamlit 应用设置为私有或仅允许受信任账号访问；不要将公共链接直接对外发布。
-- Streamlit Community Cloud 的托管区域并不适合所有敏感招投标材料。若文档涉及商业秘密、境内存储或数据出境要求，应先完成组织的法务与安全评估；不满足条件时应改用境内或内网私有部署。
-- Community Cloud 的会话状态和本地磁盘不是长期任务存储。生成报告后请及时下载；若需要关页后继续、任务队列或持久化审计，应改用外部任务服务与持久化存储。
-
-## 安全与使用边界
-
-- API Key 只通过 Streamlit Secrets 读取，不提供前端输入框，也不应写入 Excel、日志或仓库。
-- 上传内容会发送到配置的模型服务商。部署前应确认服务商条款、数据存储位置以及所在组织的保密与数据合规要求。
-- 应用会校验空文件、损坏 DOCX、异常 ZIP 结构和任务规模上限，但文件扩展名本身不是安全保证。
-- 本地候选检索与重点全文补扫用于提高文字证据召回；即便补扫完成，模型仍可能未理解同义表达，因此未命中不能被宣传为数学意义上的“全文不存在”。
-- 模型输出可能遗漏、误判或产生不准确结论。提交投标前必须由专业人员核对招标原文、投标原件、扫描材料及 Excel 中的人工复核项。
-- 若出现 `model not found`，请由管理员在 Secrets 中将 `DEEPSEEK_MODEL` 改为当前 DeepSeek 账户实际可用的模型 ID，然后重新部署或 Reboot。
-
-## 依赖版本
-
-```text
-streamlit==1.61.1
-openai==2.53.0
-python-docx==1.2.0
-openpyxl==3.1.5
-pandas==2.3.3
-```
-
-## 官方参考
-
-- [DeepSeek API 文档](https://api-docs.deepseek.com/zh-cn/)
-- [DeepSeek JSON Output](https://api-docs.deepseek.com/zh-cn/guides/json_mode/)
-- [Streamlit Community Cloud 部署](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy)
-- [Streamlit Community Cloud 依赖](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/app-dependencies)
+5. 保存后执行 Reboot。页面侧边栏应显示 `v3.0.0` 和 `deepseek-v4-flash`。
+6. 上传两份 DOCX，日志应出现“三路长上下文并发核查”，且最终调用数不超过 6；如果仍出现“逐块清点”或递归二分日志，说明 Cloud 尚未部署到 v3。
